@@ -66,6 +66,22 @@ Access the Web UI from a browser at `localhost:8998` if running locally, otherwi
 Access the Web UI directly at https://11.54.401.33:8998
 ```
 
+### Python Realtime Client
+
+You can also connect with a Python mic/speaker client (uses `sounddevice` + `sphn`):
+```bash
+moshi-client \
+  --host localhost \
+  --port 8998 \
+  --secure \
+  --insecure \
+  --voice-prompt NATF2.pt \
+  --text-prompt "You enjoy having a good conversation."
+```
+
+- Use `--secure` when the server is started with `--ssl`.
+- `--insecure` is useful for local self-signed certs.
+
 ### Offline Evaluation
 
 For offline evaluation use the offline script that streams in an input wav file and produces an output wav file from the captured output stream. The output file will be the same duration as the input file.
