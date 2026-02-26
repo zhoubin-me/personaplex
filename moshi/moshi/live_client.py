@@ -23,6 +23,7 @@ import argparse
 import asyncio
 from dataclasses import dataclass, field
 import ssl
+import sys
 import threading
 from typing import Optional
 from urllib.parse import urlencode
@@ -159,6 +160,7 @@ async def run_client(
     opus_reader = sphn.OpusStreamReader(sample_rate)
 
     mic_queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=256)
+    text_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=4096)
     playback = PlaybackBuffer()
     stop_event = asyncio.Event()
     started = asyncio.Event()
@@ -168,6 +170,9 @@ async def run_client(
     loop = asyncio.get_running_loop()
 
     def _push_mic_chunk(chunk: np.ndarray):
+        if not started.is_set():
+            # Keep capture live but avoid queueing stale pre-handshake audio.
+            return
         if mic_queue.full():
             try:
                 _ = mic_queue.get_nowait()
@@ -210,6 +215,12 @@ async def run_client(
                     payload = data[1:]
                     if kind == 0:
                         print("Handshake received. Streaming started.")
+                        # Drop any stale chunks captured before handshake.
+                        while True:
+                            try:
+                                _ = mic_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
                         started.set()
                     elif kind == 1:
                         stats.add_rx(len(payload))
@@ -222,8 +233,33 @@ async def run_client(
                             playback.append(pcm.astype(np.float32, copy=False))
                     elif kind == 2:
                         stats.add_text()
-                        print(payload.decode("utf-8"), end="", flush=True)
+                        text = payload.decode("utf-8")
+                        if text_queue.full():
+                            try:
+                                _ = text_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                pass
+                        try:
+                            text_queue.put_nowait(text)
+                        except asyncio.QueueFull:
+                            pass
                 stop_event.set()
+
+            async def text_loop():
+                # Batch tiny text tokens so terminal I/O does not block audio handling.
+                while not stop_event.is_set():
+                    try:
+                        token = await asyncio.wait_for(text_queue.get(), timeout=0.05)
+                    except asyncio.TimeoutError:
+                        continue
+                    chunks = [token]
+                    while True:
+                        try:
+                            chunks.append(text_queue.get_nowait())
+                        except asyncio.QueueEmpty:
+                            break
+                    sys.stdout.write("".join(chunks))
+                    sys.stdout.flush()
 
             async def send_loop():
                 nonlocal first_tx_printed
@@ -232,6 +268,12 @@ async def run_client(
                         await asyncio.sleep(0.01)
                         continue
                     chunk = await mic_queue.get()
+                    # Bound end-to-end latency by preferring freshest mic audio.
+                    while mic_queue.qsize() > 2:
+                        try:
+                            chunk = mic_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
                     opus_writer.append_pcm(chunk)
                     payload = opus_writer.read_bytes()
                     if payload:
@@ -278,10 +320,12 @@ async def run_client(
                 device=output_device,
             ):
                 recv_task = asyncio.create_task(recv_loop())
+                text_task = asyncio.create_task(text_loop())
                 send_task = asyncio.create_task(send_loop())
                 stats_task = asyncio.create_task(stats_loop())
                 done, pending = await asyncio.wait(
-                    [recv_task, send_task, stats_task], return_when=asyncio.FIRST_COMPLETED
+                    [recv_task, text_task, send_task, stats_task],
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
                 for task in pending:
                     task.cancel()
